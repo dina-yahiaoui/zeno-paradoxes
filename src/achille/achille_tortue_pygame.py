@@ -1,203 +1,182 @@
 # src/achille/achille_tortue_pygame.py
 import sys
 from pathlib import Path
+import pygame as pg
 
-# --- Rendre importable: mettre src/ dans sys.path pour "from achille.achille_tortue import simulate"
-THIS_FILE = Path(__file__).resolve()
-SRC_DIR = THIS_FILE.parents[1]   # .../src
+# --- rendre 'src/' importable pour faire from achille.achille_tortue import simulate
+THIS = Path(__file__).resolve()
+SRC_DIR = THIS.parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from achille.achille_tortue import simulate  # <-- ALGORITHME réutilisé
-
-import pygame
+from achille.achille_tortue import simulate  # <-- TON ALGO
 
 # -----------------------------
-# Paramètres de simulation
+# Paramètres de simulation (garde tes valeurs)
 # -----------------------------
-V_ACHILLE = 5.0
-V_TORTUE  = 2.0
-LEAD      = 20.0
-DT        = 0.05     # pas de simulation pour generate results
-T_MAX     = 60.0
-TIME_SCALE = 1.0     # 1.0=temps réel; 2.0=2x plus vite
-
-# Logging terminal (fréquence d'impression)
-LOG_EVERY = 0.1      # secondes simulées
+V_ACHILLE  = 5.0
+V_TORTUE   = 2.0
+LEAD       = 20.0
+DT         = 0.05
+T_MAX      = 60.0
+TIME_SCALE = 1.0   # 1.0 = temps réel (augmente si tu veux accélérer)
+SCALE_M2PX = 10    # 1 m = 10 px (uniquement pour l'affichage graduations)
 
 # -----------------------------
-# Affichage (Pygame)
+# Couleurs
 # -----------------------------
-WIDTH, HEIGHT = 1000, 260
-MARGIN_LEFT, MARGIN_RIGHT = 60, 40
-TRACK_Y = HEIGHT // 2
-SCALE = 10
-
 BG    = (25, 28, 35)
 GREY  = (90, 100, 115)
+WHITE = (240, 240, 240)
 BLUE  = (110, 160, 255)
 GREEN = (100, 200, 120)
-WHITE = (240, 240, 240)
 YELL  = (240, 200, 80)
 
-# Assets PNG
-ASSETS_DIR = THIS_FILE.parents[2] / "assets"  # .../zeno-paradoxes/assets
+# -----------------------------
+# Sprites
+# -----------------------------
+ASSETS_DIR = THIS.parents[2] / "assets"   # adapte si ton dossier est ailleurs
 ACHILLE_IMG_PATH = ASSETS_DIR / "achille.png"
 TORTUE_IMG_PATH  = ASSETS_DIR / "tortue.png"
 
-def load_sprite(path: Path, size=(48, 48)):
+def _load_sprite(path: Path, size=(48, 48)):
     try:
-        img = pygame.image.load(str(path)).convert_alpha()
+        img = pg.image.load(str(path)).convert_alpha()
         if size:
-            img = pygame.transform.smoothscale(img, size)
+            img = pg.transform.smoothscale(img, size)
         return img, True
     except Exception as e:
-        print(f"[WARN] Sprite introuvable: {path} -> {e}")
+        print(f"[WARN] sprite introuvable: {path} -> {e}", flush=True)
         return None, False
 
-def build_trajectory():
-    """Appelle l'algo unique pour construire la trajectoire discrète (liste de (t, xA, xT))."""
-    results, info = simulate(
-        v_achille=V_ACHILLE,
-        v_tortue=V_TORTUE,
-        lead=LEAD,
-        dt=DT,
-        t_max=T_MAX,
-    )
-    return results, info
 
-def interpolate_at(target_t, results, start_idx=0):
-    """
-    Renvoie (t, xA, xT, idx) pour l'instant target_t en interpolant linéairement
-    entre results[idx] et results[idx+1]. start_idx permet d'éviter de repartir de 0 à chaque fois.
-    """
-    n = len(results)
-    i = start_idx
-    # avancer i jusqu'à ce que results[i].t <= target_t < results[i+1].t
-    while i + 1 < n and results[i + 1][0] <= target_t:
-        i += 1
-    t_i, xa_i, xt_i = results[i]
-    if i + 1 < n:
-        t_j, xa_j, xt_j = results[i + 1]
-        if t_j > t_i:
+class AchilleScene:
+    """Classe uniforme (update/draw/handle_event) -> compatible avec zenon_menu."""
+    def __init__(self, screen: pg.Surface):
+        self.screen = screen
+        self.W, self.H = screen.get_size()
+        self.margin_left, self.margin_right = 60, 40
+        self.line_y = self.H // 2  # piste au milieu
+        self.font = pg.font.SysFont("consolas", 18)
+
+        # sprites
+        self.achille_sprite, self.achille_ok = _load_sprite(ACHILLE_IMG_PATH, (48, 48))
+        self.tortue_sprite,  self.tortue_ok  = _load_sprite(TORTUE_IMG_PATH,  (48, 48))
+
+        # trajectoire depuis TON algo
+        self._build_trajectory()
+
+        # état d'animation
+        self.sim_time = 0.0
+        self.idx_anim = 0
+        self.caught_runtime = False
+        self.x_a = 0.0
+        self.x_t = LEAD
+        self.t   = 0.0
+
+        # ---------- LOGGER TERMINAL ----------
+        self.LOG_EVERY  = 0.1   # log toutes les 0.1 s simulées
+        self.next_log_t = 0.0
+        print("\n[ACHILLE] t (s) | Achille (m) | Tortue (m)", flush=True)
+
+    def _build_trajectory(self):
+        self.results, (self.caught_final, self.t_hit_final, self.x_hit_final) = simulate(
+            v_achille=V_ACHILLE,
+            v_tortue=V_TORTUE,
+            lead=LEAD,
+            dt=DT,
+            t_max=T_MAX,
+        )
+
+    def _interp_at(self, target_t: float, start_idx=0):
+        """Interpolation linéaire position Achille/Tortue à l'instant target_t."""
+        n = len(self.results)
+        i = start_idx
+        while i + 1 < n and self.results[i + 1][0] <= target_t:
+            i += 1
+
+        t_i, xa_i, xt_i = self.results[i]
+        if i + 1 < n:
+            t_j, xa_j, xt_j = self.results[i + 1]
+            if t_j == t_i:
+                return target_t, xa_i, xt_i, i
             alpha = (target_t - t_i) / (t_j - t_i)
+            x_a = xa_i + alpha * (xa_j - xa_i)
+            x_t = xt_i + alpha * (xt_j - xt_i)
+            return target_t, x_a, x_t, i
         else:
-            alpha = 0.0
-        x_a = xa_i + alpha * (xa_j - xa_i)
-        x_t = xt_i + alpha * (xt_j - xt_i)
-        return target_t, x_a, x_t, i
-    else:
-        # target_t est en fin de trajectoire
-        return results[-1][0], results[-1][1], results[-1][2], i
+            return self.results[-1][0], self.results[-1][1], self.results[-1][2], i
 
-def main():
-    # 1) Construire la trajectoire via l'ALGORITHME importé
-    results, (caught_final, t_hit_final, x_hit_final) = build_trajectory()
-    if len(results) < 2:
-        print("[ERROR] Trajectoire trop courte. Vérifie DT et T_MAX.")
-        return
+    # --- events transmis par le menu
+    def handle_event(self, event):
+        if event.type == pg.KEYDOWN and event.key == pg.K_r:
+            # reset animation + trajectoire (garde tes paramètres)
+            self.sim_time = 0.0
+            self.idx_anim = 0
+            self.caught_runtime = False
+            self._build_trajectory()
+            self.next_log_t = 0.0
+            print("\n[ACHILLE] --- RESET ---", flush=True)
+            print("[ACHILLE] t (s) | Achille (m) | Tortue (m)", flush=True)
 
-    # 2) Préparer le logging terminal
-    print("t (s) | Achille (m) | Tortue (m)")
-    print("-" * 28)
-    next_log_t = 0.0
-    log_idx = 0  # index pour accélérer l'interpolation côté terminal
+    def update(self, dt: float):
+        # avancer le temps simulé
+        self.sim_time += dt * TIME_SCALE
+        if self.sim_time > self.results[-1][0]:
+            self.sim_time = self.results[-1][0]
 
-    # 3) Init Pygame
-    pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Achille & la Tortue — (algo importé) Terminal + Pygame")
-    clock = pygame.time.Clock()
-    font = pygame.font.SysFont("consolas", 18)
+        # --- logs terminal à intervalles réguliers ---
+        while self.next_log_t <= self.sim_time and self.next_log_t <= self.results[-1][0]:
+            tL, xAL, xTL, self.idx_anim = self._interp_at(self.next_log_t, start_idx=self.idx_anim)
+            print(f"[ACHILLE] {tL:7.2f} | {xAL:11.2f} | {xTL:9.2f}", flush=True)
+            self.next_log_t += self.LOG_EVERY
 
-    achille_sprite, achille_ok = load_sprite(ACHILLE_IMG_PATH, (48, 48))
-    tortue_sprite,  tortue_ok  = load_sprite(TORTUE_IMG_PATH,  (48, 48))
+        # état courant pour l'affichage
+        t, x_a, x_t, self.idx_anim = self._interp_at(self.sim_time, start_idx=self.idx_anim)
+        self.x_a, self.x_t, self.t = x_a, x_t, t
+        if not self.caught_runtime and x_a >= x_t:
+            self.caught_runtime = True
 
-    # 4) État de l'animation
-    sim_time = 0.0   # temps simulé affiché à l'écran
-    anim_idx = 0     # index pour l'interpolation côté animation
-    caught_runtime = False
-
-    running = True
-    while running:
-        # a) Events
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                # Recalculer la trajectoire et réinitialiser
-                results, (caught_final, t_hit_final, x_hit_final) = build_trajectory()
-                sim_time = 0.0
-                anim_idx = 0
-                next_log_t = 0.0
-                log_idx = 0
-                caught_runtime = False
-                print("\n--- RESET ---")
-                print("t (s) | Achille (m) | Tortue (m)")
-                print("-" * 28)
-
-        # b) Avancer le temps simulé en fonction du temps réel
-        dt_real = clock.get_time() / 1000.0
-        sim_time += dt_real * TIME_SCALE
-        if sim_time > results[-1][0]:
-            sim_time = results[-1][0]
-
-        # c) LOGGING TERMINAL à cadence régulière (selon le temps simulé)
-        # Imprimer autant de lignes que nécessaire tant que sim_time a dépassé next_log_t
-        while next_log_t <= sim_time and next_log_t <= results[-1][0]:
-            t_log, xa_log, xt_log, log_idx = interpolate_at(next_log_t, results, start_idx=log_idx)
-            print(f"{t_log:5.1f} | {xa_log:11.2f} | {xt_log:9.2f}")
-            next_log_t += LOG_EVERY
-
-        # d) Position pour l'ANIMATION (interpolation au temps sim_time)
-        t, x_a, x_t, anim_idx = interpolate_at(sim_time, results, start_idx=anim_idx)
-
-        if not caught_runtime and x_a >= x_t:
-            caught_runtime = True
-
-        # e) DESSIN
-        screen.fill(BG)
+    def draw(self):
+        surf = self.screen
+        surf.fill(BG)
 
         # piste
-        pygame.draw.line(screen, GREY, (MARGIN_LEFT, TRACK_Y), (WIDTH - MARGIN_RIGHT, TRACK_Y), 3)
+        pg.draw.line(surf, GREY, (self.margin_left, self.line_y),
+                               (self.W - self.margin_right, self.line_y), 3)
 
-        # graduations
-        max_m = int((WIDTH - MARGIN_LEFT - MARGIN_RIGHT) / SCALE)
+        # graduations en mètres (optionnel, basé sur SCALE_M2PX)
+        max_m = int((self.W - self.margin_left - self.margin_right) / SCALE_M2PX)
         for m in range(0, max_m + 1, 10):
-            xg = MARGIN_LEFT + m * SCALE
-            pygame.draw.line(screen, GREY, (xg, TRACK_Y - 10), (xg, TRACK_Y + 10), 1)
-            screen.blit(font.render(f"{m} m", True, GREY), (xg - 14, TRACK_Y + 14))
+            xg = self.margin_left + m * SCALE_M2PX
+            pg.draw.line(surf, GREY, (xg, self.line_y - 10), (xg, self.line_y + 10), 1)
+            surf.blit(self.font.render(f"{m} m", True, GREY), (xg - 14, self.line_y + 14))
 
-        # conversion mètres -> pixels
-        x_a_px = min(MARGIN_LEFT + int(x_a * SCALE), WIDTH - MARGIN_RIGHT)
-        x_t_px = min(MARGIN_LEFT + int(x_t * SCALE), WIDTH - MARGIN_RIGHT)
+        # conversion m -> px pour placer les sprites
+        x_a_px = min(self.margin_left + int(self.x_a * SCALE_M2PX), self.W - self.margin_right)
+        x_t_px = min(self.margin_left + int(self.x_t * SCALE_M2PX), self.W - self.margin_right)
 
-        # sprites (fallback ronds si absents)
-        if achille_ok:
-            screen.blit(achille_sprite, achille_sprite.get_rect(center=(x_a_px, TRACK_Y)))
+        # Achille posé sur la ligne (midbottom = bas du sprite collé à la piste)
+        if self.achille_ok:
+            ach_rect = self.achille_sprite.get_rect(midbottom=(x_a_px, self.line_y + 2))
+            surf.blit(self.achille_sprite, ach_rect)
         else:
-            pygame.draw.circle(screen, BLUE, (x_a_px, TRACK_Y), 12)
-        if tortue_ok:
-            screen.blit(tortue_sprite, tortue_sprite.get_rect(center=(x_t_px, TRACK_Y)))
+            pg.draw.circle(surf, BLUE, (x_a_px, self.line_y), 12)
+
+        # Tortue posée sur la ligne
+        if self.tortue_ok:
+            tor_rect = self.tortue_sprite.get_rect(midbottom=(x_t_px, self.line_y + 2))
+            surf.blit(self.tortue_sprite, tor_rect)
         else:
-            pygame.draw.circle(screen, GREEN, (x_t_px, TRACK_Y), 12)
+            pg.draw.circle(surf, GREEN, (x_t_px, self.line_y), 12)
 
-        # infos
-        info = f"t={t:5.2f}s | xA={x_a:6.2f} m | xT={x_t:6.2f} m | vA={V_ACHILLE} | vT={V_TORTUE}"
-        screen.blit(font.render(info, True, WHITE), (20, 12))
+        # Infos
+        info = f"t={self.t:5.2f}s | xA={self.x_a:6.2f} m | xT={self.x_t:6.2f} m | vA={V_ACHILLE} | vT={V_TORTUE}"
+        surf.blit(self.font.render(info, True, WHITE), (20, 12))
 
-        if caught_runtime:
-            screen.blit(font.render("✅ Rattrapée", True, YELL), (20, HEIGHT - 36))
-            # On affiche aussi le t_hit exact uniquement à ce moment
-            if caught_final:
-                screen.blit(font.render(f"t_hit (algo) ≈ {t_hit_final:.2f}s @ x ≈ {x_hit_final:.2f} m",
-                                True, WHITE), (20, HEIGHT - 18))
-
-
-        pygame.display.flip()
-        clock.tick(60)
-
-    pygame.quit()
-
-if __name__ == "__main__":
-    main()
+        if self.caught_runtime:
+            surf.blit(self.font.render("✅ Rattrapée (animation)", True, YELL), (20, self.H - 36))
+            if self.caught_final:
+                surf.blit(self.font.render(
+                    f"t_hit (algo) ≈ {self.t_hit_final:.2f}s, x ≈ {self.x_hit_final:.2f} m",
+                    True, WHITE), (20, self.H - 18))
